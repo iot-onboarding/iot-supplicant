@@ -353,7 +353,8 @@ error:
 
 
 static int set_cred_property(struct wpa_cred *cred,
-			     struct wpa_dbus_dict_entry *entry)
+			struct wpa_dbus_dict_entry *entry, 
+			struct wpa_config *config)
 {
 	size_t size;
 	int ret;
@@ -387,7 +388,7 @@ static int set_cred_property(struct wpa_cred *cred,
 					return -1;
 			}
 
-			ret = wpa_config_set_cred(cred, entry->key, value, 0);
+			ret = wpa_config_set_cred(cred, entry->key, value, 0, config);
 			os_free(value);
 			if (ret < 0)
 				return -1;
@@ -458,7 +459,7 @@ static int set_cred_property(struct wpa_cred *cred,
 		return -1;
 	}
 
-	ret = wpa_config_set_cred(cred, entry->key, value, 0);
+	ret = wpa_config_set_cred(cred, entry->key, value, 0, config);
 	os_free(value);
 	return ret;
 }
@@ -490,7 +491,7 @@ static dbus_bool_t set_cred_properties(struct wpa_supplicant *wpa_s,
 		if (!wpa_dbus_dict_get_entry(&iter_dict, &entry)) {
 			res = -1;
 		} else {
-			res = set_cred_property(cred, &entry);
+			res = set_cred_property(cred, &entry, wpa_s->conf);
 			wpa_dbus_dict_entry_clear(&entry);
 		}
 
