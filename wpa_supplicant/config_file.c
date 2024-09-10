@@ -157,7 +157,7 @@ static struct wpa_ssid * wpa_config_read_network(FILE *f, int *line, int id)
 }
 
 
-static struct wpa_cred * wpa_config_read_cred(FILE *f, int *line, int id)
+static struct wpa_cred * wpa_config_read_cred(FILE *f, int *line, int id, struct wpa_config *config)
 {
 	struct wpa_cred *cred;
 	int errors = 0, end = 0;
@@ -194,7 +194,7 @@ static struct wpa_cred * wpa_config_read_cred(FILE *f, int *line, int id)
 			}
 		}
 
-		if (wpa_config_set_cred(cred, pos, pos2, *line) < 0)
+		if (wpa_config_set_cred(cred, pos, pos2, *line, config) < 0)
 			errors++;
 	}
 
@@ -360,7 +360,7 @@ struct wpa_config * wpa_config_read(const char *name, struct wpa_config *cfgp,
 				continue;
 			}
 		} else if (os_strcmp(pos, "cred={") == 0) {
-			cred = wpa_config_read_cred(f, &line, cred_id++);
+			cred = wpa_config_read_cred(f, &line, cred_id++, config);
 			if (cred == NULL) {
 				wpa_printf(MSG_ERROR, "Line %d: failed to "
 					   "parse cred block.", line);

@@ -3988,7 +3988,7 @@ static int wpa_supplicant_ctrl_iface_set_cred(struct wpa_supplicant *wpa_s,
 		return -1;
 	}
 
-	if (wpa_config_set_cred(cred, name, value, 0) < 0) {
+	if (wpa_config_set_cred(cred, name, value, 0, wpa_s->conf) < 0) {
 		wpa_printf(MSG_DEBUG, "CTRL_IFACE: Failed to set cred "
 			   "variable '%s'", name);
 		return -1;

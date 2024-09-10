@@ -20,6 +20,15 @@
 #include "fst/fst.h"
 #include "config.h"
 
+#ifdef CONFIG_HS20_CERT_ATTR
+#include <openssl/x509v3.h>
+#include <openssl/pem.h>
+#endif /* CONFIG_HS20_CERT_ATTR */
+
+
+#ifdef CONFIG_HS20_CERT_ATTR
+static int configHS20CredsFromClientCert(struct wpa_cred *cred, char *cert_filename, struct wpa_config *config);
+#endif /* CONFIG_HS20_CERT_ATTR */
 
 #if !defined(CONFIG_CTRL_IFACE) && defined(CONFIG_NO_CONFIG_WRITE)
 #define NO_CONFIG_WRITE
@@ -3692,7 +3701,7 @@ wpa_config_set_cred_ois(u8 cred_ois[MAX_ROAMING_CONS][MAX_ROAMING_CONS_OI_LEN],
 
 
 int wpa_config_set_cred(struct wpa_cred *cred, const char *var,
-			const char *value, int line)
+			const char *value, int line, struct wpa_config *config)
 {
 	char *val;
 	size_t len;
@@ -3836,6 +3845,9 @@ int wpa_config_set_cred(struct wpa_cred *cred, const char *var,
 	if (os_strcmp(var, "client_cert") == 0) {
 		os_free(cred->client_cert);
 		cred->client_cert = val;
+#ifdef CONFIG_HS20_CERT_ATTR
+		configHS20CredsFromClientCert(cred, val, config);
+#endif /* CONFIG_HS20_CERT_ATTR */	
 		return 0;
 	}
 
@@ -5762,3 +5774,279 @@ int wpa_config_process_global(struct wpa_config *config, char *pos, int line)
 
 	return ret;
 }
+
+#ifdef CONFIG_HS20_CERT_ATTR
+
+/*
+ * keyValuePair used in certificate decoding of Certificate Attribute
+ */
+#define MAX_ATTR_LENGTH 1024
+#define MAX_KEY_NAME_LENGTH 32
+#define MAX_KEY_VALUE_LENGTH 255
+
+typedef struct {
+	char key[MAX_KEY_NAME_LENGTH];
+	char value[MAX_KEY_VALUE_LENGTH];
+} KeyValuePair;
+
+int percentDecode(char* out, const char* in) {
+	static const char ascii_to_hex[0x100] = {
+		-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x00 - 0x0F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x10 - 0x1F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x20 - 0x2F
+         	 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,-1,-1,-1,-1,-1,-1, // ASCII 0x30 (digit 0) - 0x3F
+        	-1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x40, 0x41 (letter A) - 0x4F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x50 - 0x5F
+        	-1,10,11,12,13,14,15,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x60, 0x61 (letter a) - 0x6F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x70 - 0x7F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x80 - 0x8F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0x90 - 0x9F
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0xA0 - 0xAF
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0xB0 - 0xBF
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0xC0 - 0xCF
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0xD0 - 0xDF
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // ASCII 0xE0 - 0xEF
+        	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1  // ASCII 0xF0 - 0xFF
+    	};
+    	char char1, char2;
+
+    	unsigned long len = strlen(in);
+    	size_t i = 0, j = 0;
+    	while (i < len)
+    	{
+        	if(in[i] == '%' && i + 2 < len) {
+            		if((char1 = ascii_to_hex[ (unsigned char)in[i+1] ])!=-1 &&
+            		(char2 = ascii_to_hex[ (unsigned char)in[i+2] ])!=-1)
+            		{
+                		out[j] = (char1 << 4) | char2;
+                		j++;
+                		i += 3;
+            		}
+        	} else {
+            		out[j] = in[i];
+            		i++;
+            		j++;
+        	}
+    	}
+    	out[j] = '\0';
+    	return 0;
+}
+
+int parseKeyValuePair(const char *pairString, KeyValuePair *pair) {
+    	char *delimiterPos = strchr(pairString, '=');
+    	if (delimiterPos == NULL) {
+        	wpa_printf(MSG_INFO, "cert-ppsmo: Key-value pair does not contain '=' delimiter.");
+        	return -1;
+    	}
+
+    	size_t keyLength = delimiterPos - pairString;
+    	if (keyLength >= MAX_KEY_NAME_LENGTH) {
+        	wpa_printf(MSG_INFO, "cert-ppsmo: Key name too long.");
+        	return -1;
+    	}
+
+    	size_t valueLength = strlen(delimiterPos + 1);
+    	if (valueLength >= MAX_KEY_VALUE_LENGTH) {
+        	wpa_printf(MSG_INFO, "cert-ppsmo: Value too long.");
+        	return -1;
+    	}
+
+    	memcpy(pair->key, pairString, keyLength);
+    	pair->key[keyLength] = '\0';
+
+    	memcpy(pair->value, delimiterPos + 1, valueLength + 1); // Include null-terminator
+
+    	return 0;
+}
+
+int parseHS20Attr(const char *attr, KeyValuePair *keyValuePairs, int *pairCount) {
+    	if (attr == NULL) {
+        	wpa_printf(MSG_INFO, "cert-ppsmo: WBA ppsmo attribute is NULL.");
+        	return -1;
+    	}
+
+    	if (*attr == '\0') {
+        	wpa_printf(MSG_INFO, "cert-ppsmo: No key-value pairs present in ppsmo attribute.");
+        	return -1;
+    	}
+
+    	char attrCopy[MAX_ATTR_LENGTH];
+    	strncpy(attrCopy, attr, MAX_ATTR_LENGTH);
+    	attrCopy[MAX_ATTR_LENGTH - 1] = '\0';
+
+    	char *pairString = strtok(attrCopy, ";");
+    	int count = 0;
+
+    	while (pairString != NULL) {
+        	if (parseKeyValuePair(pairString, &keyValuePairs[count]) != 0) {
+            		// parseKeyValuePair already prints an error message on failure to parse
+            		return -1;
+        	}
+        	count++;
+        	pairString = strtok(NULL, ";");
+    	}
+
+    	*pairCount = count;
+    	return 0;
+}
+
+static int configHS20CredsFromClientCert(struct wpa_cred *cred, char *cert_filename, struct wpa_config *config)
+{
+    	// permitted key values to be encoded WBA PPSMO Attribute
+    	char *permittedKeys[] = {
+            	"priority",
+            	"ocsp",
+            	"excluded_ssid",
+            	"realm",
+            	"username",
+            	"domain_suffix_match",
+            	"domain",
+            	"home_ois",
+            	"required_home_ois",
+            	"roaming_consortiums",
+            	"roaming_partner"
+	};
+    	int numberOfKeys = sizeof(permittedKeys) / sizeof(permittedKeys[0]);
+	// WBA PPSMO attribute
+	char *wba_oid = "1.3.6.1.4.1.14122.1.2.1";
+	
+    	FILE *f = fopen(cert_filename, "r");
+    	if (!f) {
+		wpa_printf(MSG_INFO, "cert-ppsmo: Error opening certificate file %s", cert_filename);
+        	return 0;
+    	}
+
+    	// Try to read the certificate in PEM format
+    	X509 *cert = PEM_read_X509(f, NULL, NULL, NULL);
+    	if (!cert) {
+        	// If PEM read fails, try to read it as a DER formatted certificate
+        	rewind(f);
+        	cert = d2i_X509_fp(f, NULL);
+        	if (!cert){
+	    		wpa_printf(MSG_INFO, "cert-ppsmo: Error reading PEM/DER file %s\n", cert_filename);
+            		fclose(f);
+           		return 0;
+        	}
+    	}
+
+	int ext_count = X509_get_ext_count(cert);
+	for (int i = 0; i < ext_count; i++) {
+		X509_EXTENSION *ext = X509_get_ext(cert, i);
+		ASN1_OBJECT *obj = X509_EXTENSION_get_object(ext);
+		char obj_txt[MAX_ATTR_LENGTH];
+		OBJ_obj2txt(obj_txt, sizeof(obj_txt), obj, 1);
+		if (strcmp(obj_txt, wba_oid) == 0) {
+			wpa_printf(MSG_INFO, "cert-ppsmo: Found WBA PPSMO Attribute");
+			ASN1_OCTET_STRING *data = X509_EXTENSION_get_data(ext);
+			unsigned char *attr = data->data;
+            		const char* constAttr;
+			attr +=2; //skip encoding and length
+			constAttr = (const char*) attr; //convert from unsigned char* to const char*
+			wpa_printf(MSG_INFO, "cert-ppsmo: Attribtue value %s",constAttr);
+			KeyValuePair keyValuePairs[11]; //  11 types of key-value pairs are defined in the WBA attribute definition
+			int pairCount = 0;
+			
+			if (parseHS20Attr(constAttr, keyValuePairs, &pairCount) == 0) {
+				wpa_printf(MSG_INFO, "cert-ppsmo: Parsed %d PPS-MO key/value pairs from WBA ppsmo attribute", pairCount);
+
+				for (int i = 0; i < pairCount; ++i) {
+	                    		int permittedKey = 0;
+	                    		int res;
+
+	                    		for (int j = 0; j < numberOfKeys; j++) {
+	                        		if (strcmp(keyValuePairs[i].key, permittedKeys[j]) == 0) {
+	                            			// A match was found
+	                            			permittedKey = 1;
+	                            			break;
+	                        		}
+	                    		}
+					if (permittedKey) {
+						percentDecode(keyValuePairs[i].value, keyValuePairs[i].value);
+						wpa_printf(MSG_INFO, "cert-ppsmo: Valid PPS-MO key/value pair: %s=%s", keyValuePairs[i].key, keyValuePairs[i].value);
+
+						if (os_strcmp(keyValuePairs[i].key, "realm") == 0) {
+							os_free(cred->realm);
+							cred->realm = os_strdup(keyValuePairs[i].value);
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "ocsp") == 0) {
+							cred->ocsp = atoi(keyValuePairs[i].value);
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "priority") == 0) {
+							cred->priority = atoi(keyValuePairs[i].value);
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "roaming_consortiums") == 0) {
+							res = wpa_config_set_cred_ois(cred->roaming_consortiums,
+							cred->roaming_consortiums_len,
+							&cred->num_roaming_consortiums,
+							keyValuePairs[i].value);
+							if (res < 0)
+								wpa_printf(MSG_ERROR,"cert-ppsmo: invalid roaming_consortiums");
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "home_ois") == 0) {
+							res = wpa_config_set_cred_ois(cred->home_ois,
+							cred->home_ois_len,
+							&cred->num_home_ois,
+							keyValuePairs[i].value);
+							if (res < 0)
+								wpa_printf(MSG_ERROR, "cert-ppsmo: invalid home_ois");
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "username") == 0) {
+							str_clear_free(cred->username);
+							cred->username = os_strdup(keyValuePairs[i].value);
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "domain_suffix_match") == 0) {
+							os_free(cred->domain_suffix_match);
+							cred->domain_suffix_match = os_strdup(keyValuePairs[i].value);
+						}
+
+						if (os_strcmp(keyValuePairs[i].key, "domain") == 0) {
+							char **new_domain;
+							new_domain = os_realloc_array(cred->domain,
+							cred->num_domain + 1,
+							sizeof(char *));
+							if (new_domain != NULL) {
+								new_domain[cred->num_domain++] = os_strdup(keyValuePairs[i].value);
+								cred->domain = new_domain;
+							}
+						}
+
+						// ToDo excluded_ssid, required_home_ois, roaming_partner
+
+	                		} else {
+	                        		wpa_printf(MSG_INFO, "cert-ppsmo: Illegal Key: %s", keyValuePairs[i].key);
+	                		}
+                		}
+				// if WBA ppsmo attribute is found with at least one permitted key,
+				// set interworking to automatic and eap_method to TLS
+				struct eap_method_type method;
+				method.method = eap_peer_get_type("TLS", &method.vendor);
+				os_free(cred->eap_method);
+				cred->eap_method = os_malloc(sizeof(*cred->eap_method));
+				os_memcpy(cred->eap_method, &method, sizeof(method));
+
+				config->interworking = 1;
+				config->auto_interworking = 1;
+				wpa_printf(MSG_INFO, "cert-ppsmo: Setting interworking to automatic");
+				break; // do not check any more attributes after first instance of WBA ppsmo attribute
+				
+			} else {
+                		// Failed to parse WBA ppsmo attribute
+                		wpa_printf(MSG_INFO, "cert-ppsmo: Identified WBA ppsmo attribute failed parsing.");
+            		}
+			
+		}
+	}
+	
+    	X509_free(cert);
+    	fclose(f);
+
+    	return 0;
+}
+
+#endif /* CONFIG_HS20_CERT_ATTR */
