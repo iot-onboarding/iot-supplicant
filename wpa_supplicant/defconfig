@@ -686,3 +686,7 @@ CONFIG_DPP2=y
 
 # Wi-Fi Aware unsynchronized service discovery (NAN USD)
 #CONFIG_NAN_USD=y
+
+# Automatically populate HS20 attributes from EAP-TLS client certificate
+# https://wireless-broadband-alliance.github.io/wba-ppsmo-cert-attr/
+#CONFIG_HS20_CERT_ATTR
